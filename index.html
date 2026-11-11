@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>HUB — Sports Audio</title>
-<script src="https://cdn.jsdelivr.net/npm/livekit-client@2.5.5/dist/livekit-client.umd.min.js"></script>
+<!-- No LiveKit client needed — audio comes via WebSocket from our server relay -->
 <style>
 :root {
   --bg:#0e0e0f; --sidebar:#131315; --card:#1a1a1e; --card-hover:#202026;
@@ -393,7 +393,7 @@ input[type=range].vol::-moz-range-thumb{
 const API = window.location.origin;
 let authToken = null, currentUser = null;
 let channels = [];
-let activeSessions = new Map(); // id -> {room,sessionId,heartbeat,name,callerName,isLive,audioEl,muted,volume}
+let activeSessions = new Map(); // id -> {ws, audioCtx, worklet, gain, muted, volume, name, callerName, _stopping}
 let currentFilter = 'all';
 let channelRefreshTimer = null;
 let playerCollapsed = false;
@@ -588,15 +588,15 @@ function toggleMute(channelId) {
   const sess=activeSessions.get(channelId);
   if(!sess) return;
   sess.muted=!sess.muted;
-  if(sess.audioEl) sess.audioEl.muted=sess.muted;
+  if(sess.gain) sess.gain.gain.value = sess.muted ? 0 : (sess.volume ?? 1);
   updatePlayer();
 }
 
 function muteAll() {
   const anyUnmuted=[...activeSessions.values()].some(s=>!s.muted);
-  activeSessions.forEach((sess,id)=>{
+  activeSessions.forEach((sess)=>{
     sess.muted=anyUnmuted;
-    if(sess.audioEl) sess.audioEl.muted=anyUnmuted;
+    if(sess.gain) sess.gain.gain.value = anyUnmuted ? 0 : (sess.volume ?? 1);
   });
   updatePlayer();
 }
@@ -605,7 +605,7 @@ function setVolume(channelId, val) {
   const sess=activeSessions.get(channelId);
   if(!sess) return;
   sess.volume=val/100;
-  if(sess.audioEl){ sess.audioEl.volume=sess.volume; }
+  if(sess.gain && !sess.muted) sess.gain.gain.value = sess.volume;
 }
 
 function popOut() {
@@ -626,73 +626,114 @@ function popOut() {
 async function toggleChannel(id,name){activeSessions.has(id)?await stopChannel(id):await startChannel(id,name);}
 
 async function startChannel(channelId, channelName) {
+  if(activeSessions.has(channelId)) return; // already running
   const btn=document.getElementById('btn-'+channelId);
   if(btn){btn.disabled=true;btn.innerHTML='…';}
+
+  const ch=channels.find(c=>c.id===channelId)||{};
+
+  // Build AudioContext + AudioWorklet + GainNode chain
+  let audioCtx, worklet, gain;
   try {
-    const res=await fetch(`${API}/api/session/start`,{method:'POST',
-      headers:{'Authorization':`Bearer ${authToken}`,'Content-Type':'application/json'},
-      body:JSON.stringify({channel_id:channelId})});
-    const session=await res.json();
-    if(!res.ok) throw new Error(session.error||'Failed to start session');
-    if(!session.url||!session.token) throw new Error('No LiveKit URL/token');
-
-    const room=new LivekitClient.Room({adaptiveStream:true,dynacast:true});
-    let audioEl=null;
-
-    room.on(LivekitClient.RoomEvent.TrackSubscribed,(track)=>{
-      if(track.kind==='audio'){
-        audioEl=track.attach();
-        audioEl.style.display='none';
-        audioEl.dataset.channelId=channelId;
-        document.body.appendChild(audioEl);
-        audioEl.play().catch(()=>{});
-        const sess=activeSessions.get(channelId);
-        if(sess){
-          sess.audioEl=audioEl;
-          audioEl.muted=sess.muted||false;
-          audioEl.volume=sess.volume??1;
-        }
-      }
-    });
-    room.on(LivekitClient.RoomEvent.Disconnected,()=>{cleanupSession(channelId);renderChannels();updatePlayer();});
-
-    await room.connect(session.url,session.token);
-
-    const heartbeat=setInterval(async()=>{
-      try{await fetch(`${API}/api/session/heartbeat`,{method:'POST',
-        headers:{'Authorization':`Bearer ${authToken}`,'Content-Type':'application/json'},
-        body:JSON.stringify({session_id:session.session_id})});}catch{}
-    },20000);
-
-    const ch=channels.find(c=>c.id===channelId)||{};
-    activeSessions.set(channelId,{room,sessionId:session.session_id,heartbeat,name:channelName,
-      callerName:ch.caller_name||'',isLive:ch.liveCaller||ch.caller_state==='phone',
-      audioEl:null,muted:false,volume:1});
-
-    showToast(`Listening: ${channelName}`,'success');
-  } catch(e){
-    showToast(e.message,'error');
+    audioCtx = new AudioContext({ sampleRate: 48000 });
+    if(audioCtx.state === 'suspended') await audioCtx.resume();
+    await audioCtx.audioWorklet.addModule('/worklet-processor.js');
+    worklet = new AudioWorkletNode(audioCtx, 'pcm-player');
+    gain    = audioCtx.createGain();
+    gain.gain.value = 1;
+    worklet.connect(gain);
+    gain.connect(audioCtx.destination);
+  } catch(e) {
+    showToast('Audio init failed: ' + e.message, 'error');
+    if(btn){btn.disabled=false;}
+    renderChannels(); updatePlayer();
+    return;
   }
+
+  // Connect WebSocket to our relay
+  const proto  = location.protocol === 'https:' ? 'wss' : 'ws';
+  const wsUrl  = `${proto}://${location.host}/ws/channel/${encodeURIComponent(channelId)}?token=${encodeURIComponent(authToken)}`;
+  const ws     = new WebSocket(wsUrl);
+  ws.binaryType = 'arraybuffer';
+
+  // Store session immediately so Stop button renders
+  activeSessions.set(channelId, {
+    ws, audioCtx, worklet, gain,
+    muted: false, volume: 1,
+    name: channelName,
+    callerName: ch.caller_name || '',
+    _stopping: false,
+  });
   renderChannels(); updatePlayer();
+
+  ws.onopen = () => {
+    showToast(`Listening: ${channelName}`, 'success');
+    if(btn){btn.disabled=false;}
+  };
+
+  ws.onmessage = ({ data }) => {
+    if(typeof data === 'string') {
+      // Control message from relay
+      try {
+        const msg = JSON.parse(data);
+        const sess = activeSessions.get(channelId);
+        if(msg.type === 'reconnecting') {
+          showToast(`${channelName}: reconnecting…`, 'info');
+          if(sess) sess._reconnecting = true;
+        } else if(msg.type === 'connected') {
+          if(sess) sess._reconnecting = false;
+        } else if(msg.type === 'offline') {
+          showToast(`${channelName}: caller offline`, 'info');
+        }
+      } catch {}
+      return;
+    }
+    // Binary PCM — transfer to AudioWorklet (zero-copy)
+    const sess = activeSessions.get(channelId);
+    if(sess && sess.worklet) {
+      sess.worklet.port.postMessage(data, [data]);
+    }
+  };
+
+  ws.onclose = () => {
+    const sess = activeSessions.get(channelId);
+    if(!sess || sess._stopping) {
+      cleanupSession(channelId);
+      renderChannels(); updatePlayer();
+      return;
+    }
+    // Unexpected close (server restarted) — auto-reconnect after 3s
+    console.log(`WebSocket closed for ${channelName}, reconnecting in 3s…`);
+    cleanupSession(channelId);
+    renderChannels(); updatePlayer();
+    setTimeout(() => {
+      if(!activeSessions.has(channelId)) startChannel(channelId, channelName);
+    }, 3000);
+  };
+
+  ws.onerror = () => {
+    showToast(`Connection error: ${channelName}`, 'error');
+  };
+
 }
 
 async function stopChannel(channelId) {
-  const sess=activeSessions.get(channelId);
-  if(!sess) return;
-  try{
-    clearInterval(sess.heartbeat);
-    await sess.room.disconnect();
-    await fetch(`${API}/api/session/end`,{method:'POST',
-      headers:{'Authorization':`Bearer ${authToken}`,'Content-Type':'application/json'},
-      body:JSON.stringify({session_id:sess.sessionId})});
-  }catch{}
+  const sess = activeSessions.get(channelId);
+  if (!sess) return;
+  sess._stopping = true;
+  try { sess.ws.close(1000, 'User stopped'); } catch {}
+  try { await sess.audioCtx.close(); } catch {}
   cleanupSession(channelId);
   renderChannels(); updatePlayer();
 }
 
-function cleanupSession(id){
+function cleanupSession(id) {
+  const sess = activeSessions.get(id);
+  if (sess) {
+    try { sess.ws.close(); } catch {}
+    try { sess.audioCtx.close(); } catch {}
+  }
   activeSessions.delete(id);
-  document.querySelectorAll(`audio[data-channel-id="${id}"]`).forEach(el=>el.remove());
 }
 
 // ─── Change password ───────────────────────────────────────────────────────

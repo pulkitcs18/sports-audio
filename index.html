@@ -449,7 +449,10 @@ async function loadChannels(manual=false) {
   }
   try {
     const res=await fetch(`${API}/api/channels`,{headers:{'Authorization':`Bearer ${authToken}`}});
-    if(!res.ok){if(res.status===401){clearInterval(channelRefreshTimer);signOut();}return;}
+    // On 401 from a background poll: do NOT sign out — the WebSocket sessions are still alive
+    // and kicking users out mid-game would be worse than stale channel data.
+    // 401 only triggers signout if the user explicitly acts (handled by requireAuth elsewhere).
+    if(!res.ok) return;
     channels=await res.json();
     renderChannels(); renderSchedule();
   } catch(e){ if(manual) showToast(e.message,'error'); }
@@ -771,6 +774,16 @@ function showToast(msg,type='success'){
   toastTimer=setTimeout(()=>t.classList.remove('show'),3000);
 }
 function esc(s){if(!s)return'';return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+
+// Resume any suspended AudioContexts when the user returns to the tab
+document.addEventListener('visibilitychange', () => {
+  if(document.visibilityState !== 'visible') return;
+  activeSessions.forEach(sess => {
+    if(sess.audioCtx && sess.audioCtx.state === 'suspended') {
+      sess.audioCtx.resume().catch(() => {});
+    }
+  });
+});
 </script>
 </body>
 </html>

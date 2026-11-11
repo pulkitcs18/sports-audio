@@ -45,22 +45,35 @@ console.log('✅ SQLite users ready');
 // ── Steve's Rodeo shared token ─────────────────────────────────────────────
 let steveToken = null;
 let steveTokenExpiry = 0;
+let steveTokenRefreshPromise = null; // deduplicates concurrent refresh calls
 
 async function getSteveToken() {
   if (steveToken && Date.now() < steveTokenExpiry) return steveToken;
-  console.log("🔐 Refreshing Steve's Rodeo token…");
-  const { data } = await axios.post(
-    `${BASE_URL}/pb/api/collections/users/auth-with-password`,
-    { identity: STEVE_USERNAME, password: STEVE_PASSWORD },
-    { headers: { 'Content-Type': 'application/json' } }
-  );
-  steveToken = data.token;
-  await axios.post(`${BASE_URL}/api/login-lock`, {}, {
-    headers: { 'Authorization': `Bearer ${steveToken}`, 'x-device-id': DEVICE_ID }
-  });
-  steveTokenExpiry = Date.now() + 23 * 60 * 60 * 1000;
-  console.log("✅ Steve's Rodeo token refreshed");
-  return steveToken;
+  // If a refresh is already in flight, share it instead of making parallel requests
+  if (steveTokenRefreshPromise) return steveTokenRefreshPromise;
+
+  steveTokenRefreshPromise = (async () => {
+    console.log("🔐 Refreshing Steve's Rodeo token…");
+    const { data } = await axios.post(
+      `${BASE_URL}/pb/api/collections/users/auth-with-password`,
+      { identity: STEVE_USERNAME, password: STEVE_PASSWORD },
+      { headers: { 'Content-Type': 'application/json' } }
+    );
+    steveToken = data.token;
+    // Set expiry before login-lock so a login-lock failure doesn't leave expiry=0
+    steveTokenExpiry = Date.now() + 23 * 60 * 60 * 1000;
+    try {
+      await axios.post(`${BASE_URL}/api/login-lock`, {}, {
+        headers: { 'Authorization': `Bearer ${steveToken}`, 'x-device-id': DEVICE_ID }
+      });
+    } catch (e) {
+      console.warn("login-lock failed (non-fatal):", e.message);
+    }
+    console.log("✅ Steve's Rodeo token refreshed");
+    return steveToken;
+  })().finally(() => { steveTokenRefreshPromise = null; });
+
+  return steveTokenRefreshPromise;
 }
 
 // ── Relay manager ─────────────────────────────────────────────────────────
@@ -88,7 +101,7 @@ app.post('/auth/login', (req, res) => {
     const user = db.prepare('SELECT * FROM users WHERE username = ?').get(username);
     if (!user || !bcrypt.compareSync(password, user.password_hash))
       return res.status(401).json({ error: 'Invalid credentials' });
-    const token = jwt.sign({ username: user.username, userId: user.id }, JWT_SECRET, { expiresIn: '24h' });
+    const token = jwt.sign({ username: user.username, userId: user.id }, JWT_SECRET, { expiresIn: '7d' });
     console.log(`✅ Login: ${username}`);
     res.json({ token, username: user.username });
   } catch (err) { console.error('Login error:', err); res.status(500).json({ error: 'Server error' }); }

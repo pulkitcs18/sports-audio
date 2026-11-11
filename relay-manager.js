@@ -4,7 +4,8 @@ const { Room, RoomEvent, AudioStream } = require('@livekit/rtc-node');
 const axios = require('axios');
 
 const GRACE_MS      = 60_000;   // leave empty room after 60s with no listeners
-const WATCHDOG_MS   = 10_000;   // reconnect if no audio frames for 10s
+const WATCHDOG_MS   = 45_000;   // reconnect if no audio frames for 45s (covers halftime / timeouts)
+const PING_MS       = 30_000;   // server→client ping to keep proxy connections alive
 const MAX_BACKOFF   = 30_000;   // cap reconnect delay at 30s
 const SAMPLE_RATE   = 48_000;
 const WS_OPEN       = 1;        // WebSocket.OPEN
@@ -41,6 +42,16 @@ class RelayManager {
     ch.listeners.add(ws);
     ws.on('close', () => this._onListenerClose(channelId, ws));
     ws.on('error', () => this._onListenerClose(channelId, ws));
+
+    // Per-listener ping to keep nginx/proxy connections alive when no audio is flowing
+    const ping = setInterval(() => {
+      if (ws.readyState === WS_OPEN) {
+        try { ws.ping(); } catch {}
+      } else {
+        clearInterval(ping);
+      }
+    }, PING_MS);
+    ws._pingTimer = ping;
   }
 
   async shutdown() {
@@ -59,7 +70,9 @@ class RelayManager {
       gracePeriodTimer:  null,
       watchdogTimer:     null,
       heartbeatTimer:    null,
-      lastFrameAt:       Date.now(),
+      pingTimer:         null,
+      lastFrameAt:       null,   // null until first frame arrives; watchdog ignores null
+      relayRunning:      false,  // guard against double-relay on resubscribe
       reconnectAttempts: 0,
       leaving:           false,
       connecting:        false,
@@ -67,6 +80,7 @@ class RelayManager {
   }
 
   _onListenerClose(channelId, ws) {
+    if (ws._pingTimer) { clearInterval(ws._pingTimer); ws._pingTimer = null; }
     const ch = this.channels.get(channelId);
     if (!ch) return;
     ch.listeners.delete(ws);
@@ -146,8 +160,9 @@ class RelayManager {
       }, 20_000);
 
       // Watchdog — detect zombie connection (connected but no audio frames)
+      // Only fires after the first frame has arrived; ignores natural broadcast silences
       ch.watchdogTimer = setInterval(() => {
-        if (ch.leaving || ch.listeners.size === 0) return;
+        if (ch.leaving || ch.listeners.size === 0 || ch.lastFrameAt === null) return;
         const age = Date.now() - ch.lastFrameAt;
         if (age > WATCHDOG_MS) {
           console.warn(`🐕 Watchdog: no frames for ${age}ms on ${channelId}`);
@@ -164,12 +179,20 @@ class RelayManager {
   }
 
   _startRelay(ch, track) {
+    // Guard: if a relay loop is already running (e.g. track resubscribed during reconnect),
+    // skip starting a second one to avoid double-broadcast
+    if (ch.relayRunning) {
+      console.log(`⚠️  Relay already running for ${ch.channelId}, skipping duplicate`);
+      return;
+    }
+    ch.relayRunning = true;
+
     const stream = new AudioStream(track, { sampleRate: SAMPLE_RATE, numChannels: 1 });
     (async () => {
       try {
         for await (const frame of stream) {
           if (ch.leaving) break;
-          ch.lastFrameAt = Date.now();
+          ch.lastFrameAt = Date.now(); // clock starts on first real frame
           if (ch.listeners.size === 0) continue;
 
           // frame.data is Int16Array — send as binary to all browser WebSockets
@@ -177,6 +200,8 @@ class RelayManager {
         }
       } catch (e) {
         if (!ch.leaving) console.error(`Audio stream error on ${ch.channelId}:`, e.message);
+      } finally {
+        ch.relayRunning = false;
       }
     })();
   }
@@ -184,7 +209,7 @@ class RelayManager {
   _broadcast(ch, data, binary) {
     ch.listeners.forEach(ws => {
       if (ws.readyState === WS_OPEN) {
-        ws.send(data, { binary });
+        try { ws.send(data, { binary }); } catch {}
       }
     });
   }
@@ -212,7 +237,9 @@ class RelayManager {
       try { ch.room.disconnect(); } catch {}
       ch.room = null;
     }
-    ch.connecting = false;
+    ch.connecting   = false;
+    ch.relayRunning = false; // allow new relay loop on reconnect
+    ch.lastFrameAt  = null;  // reset watchdog clock; starts again on first frame after reconnect
   }
 
   async _leave(channelId) {

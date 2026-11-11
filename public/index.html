@@ -487,26 +487,15 @@ function renderChannels() {
   grid.innerHTML=list.map(ch=>{
     const isActive=activeSessions.has(ch.id);
     const isLive=ch.liveCaller||ch.caller_state==='phone';
-    const startTime=ch.starts_at&&!ch.starts_at_tbd?new Date(ch.starts_at).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}):ch.starts_at_tbd?'TBD':'';
     return `<div class="channel-card ${isActive?'is-active':''} ${isLive&&!isActive?'is-live':''}">
       <div class="card-top">
         <div class="card-name">${esc(ch.display_name)}</div>
         <div class="card-badges">
           ${isActive?'<span class="badge badge-active">ON AIR</span>':''}
           ${isLive&&!isActive?'<span class="badge badge-live">LIVE</span>':''}
-          <span class="badge badge-audio">AUDIO</span>
         </div>
-      </div>
-      <div class="card-meta">
-        ${ch.caller_name?`<div class="meta-row"><svg viewBox="0 0 24 24"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>${esc(ch.caller_name)}</div>`:''}
-        ${ch.description?`<div class="meta-row"><svg viewBox="0 0 24 24"><path d="M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7zm0 9.5c-1.38 0-2.5-1.12-2.5-2.5s1.12-2.5 2.5-2.5 2.5 1.12 2.5 2.5-1.12 2.5-2.5 2.5z"/></svg>${esc(ch.description)}</div>`:''}
-        ${startTime?`<div class="meta-row"><svg viewBox="0 0 24 24"><path d="M11.99 2C6.47 2 2 6.48 2 12s4.47 10 9.99 10C17.52 22 22 17.52 22 12S17.52 2 11.99 2zM12 20c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8zm.5-13H11v6l5.25 3.15.75-1.23-4.5-2.67V7z"/></svg>${startTime}</div>`:''}
       </div>
       <div class="card-footer">
-        <div class="participants">
-          <svg viewBox="0 0 24 24"><path d="M16 11c1.66 0 2.99-1.34 2.99-3S17.66 5 16 5c-1.66 0-3 1.34-3 3s1.34 3 3 3zm-8 0c1.66 0 2.99-1.34 2.99-3S9.66 5 8 5C6.34 5 5 6.34 5 8s1.34 3 3 3zm0 2c-2.33 0-7 1.17-7 3.5V19h14v-2.5c0-2.33-4.67-3.5-7-3.5zm8 0c-.29 0-.62.02-.97.05 1.16.84 1.97 1.97 1.97 3.45V19h6v-2.5c0-2.33-4.67-3.5-7-3.5z"/></svg>
-          ${ch.participantCount||0}
-        </div>
         <button class="btn-listen ${isActive?'stop':'listen'}" id="btn-${esc(ch.id)}"
           onclick="toggleChannel(${JSON.stringify(ch.id)},${JSON.stringify(ch.display_name)})">
           ${isActive
@@ -563,11 +552,6 @@ function updatePlayer() {
       </button>
       <div class="player-info">
         <div class="player-name">${esc(sess.name)}</div>
-        <div class="player-sub">
-          <div class="status-dot ${isLive?'live':'offline'}"></div>
-          <span class="status-label ${isLive?'live':'offline'}">${isLive?'LIVE':'OFFLINE'}</span>
-          ${sess.callerName?`<span class="player-caller">${esc(sess.callerName)}</span>`:''}
-        </div>
       </div>
       <div class="vol-wrap">
         <svg viewBox="0 0 24 24"><path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z"/></svg>

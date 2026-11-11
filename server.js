@@ -107,6 +107,26 @@ app.post('/auth/login', (req, res) => {
   }
 });
 
+// POST /auth/change-password  { currentPassword, newPassword }
+app.post('/auth/change-password', requireAuth, (req, res) => {
+  try {
+    const { currentPassword, newPassword } = req.body;
+    if (!currentPassword || !newPassword) return res.status(400).json({ error: 'Missing fields' });
+    if (newPassword.length < 6) return res.status(400).json({ error: 'New password must be at least 6 characters' });
+
+    const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user.userId);
+    if (!user || !bcrypt.compareSync(currentPassword, user.password_hash)) {
+      return res.status(401).json({ error: 'Current password is incorrect' });
+    }
+
+    db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(bcrypt.hashSync(newPassword, 10), user.id);
+    console.log(`✅ Password changed: ${user.username}`);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 // POST /auth/register  { adminKey, username, password }
 app.post('/auth/register', (req, res) => {
   try {

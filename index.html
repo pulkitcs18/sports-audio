@@ -4,8 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Steve's Rodeo - Audio Player</title>
-    <!-- LiveKit client SDK -->
-    <script src="https://cdn.jsdelivr.net/npm/livekit-client/dist/livekit-client.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/livekit-client@2.5.5/dist/livekit-client.umd.min.js"></script>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #111; color: #eee; padding: 20px; }
@@ -20,6 +19,7 @@
         .btn:hover { background: #f5b030; }
         .btn.stop { background: #c0392b; color: white; }
         .btn.stop:hover { background: #e74c3c; }
+        .btn:disabled { opacity: 0.5; cursor: not-allowed; }
         .status { padding: 10px 14px; border-radius: 6px; margin: 12px 0; font-weight: 500; font-size: 0.9em; }
         .success { background: #1a3a1a; color: #4caf50; border: 1px solid #2d5a2d; }
         .error { background: #3a1a1a; color: #f44336; border: 1px solid #5a2d2d; }
@@ -39,19 +39,22 @@
         .card-footer { display: flex; justify-content: space-between; align-items: center; margin-top: 12px; }
         .participants { font-size: 0.8em; color: #888; }
         .active-count { margin-top: 20px; color: #888; font-size: 0.85em; text-align: center; }
+        .user-info { float: right; font-size: 0.85em; color: #888; margin-top: 5px; }
+        .user-info a { color: #e8a020; cursor: pointer; text-decoration: none; margin-left: 8px; }
+        .user-info a:hover { text-decoration: underline; }
     </style>
 </head>
 <body>
     <h1>🤠 Steve's Rodeo</h1>
     <p class="subtitle">Live sports audio streams</p>
 
-    <div class="auth-box">
+    <div class="auth-box" id="loginBox">
         <h2>Login</h2>
         <div id="authStatus"></div>
         <div class="row">
-            <input type="text" id="identity" placeholder="Username" value="">
-            <input type="password" id="password" placeholder="Password" value="">
-            <button class="btn" onclick="login()">Login</button>
+            <input type="text" id="username" placeholder="Username" autocomplete="username">
+            <input type="password" id="password" placeholder="Password" autocomplete="current-password">
+            <button class="btn" id="loginBtn" onclick="login()">Login</button>
         </div>
     </div>
 
@@ -68,58 +71,79 @@
     <script>
         const API = window.location.origin;
         let authToken = null;
+        let currentUser = null;
         let channels = [];
-        let activeSessions = new Map(); // channelId -> { room, sessionId, heartbeatInterval }
-        let heartbeatIntervals = new Map();
+        let activeSessions = new Map(); // channelId -> { room, sessionId, heartbeat }
+        let channelRefreshInterval = null;
 
         function setStatus(id, msg, type) {
             const el = document.getElementById(id);
+            if (!el) return;
             el.textContent = msg;
             el.className = `status ${type}`;
         }
 
         async function login() {
+            const btn = document.getElementById('loginBtn');
+            btn.disabled = true;
             try {
                 setStatus('authStatus', '🔐 Logging in...', 'loading');
-                const identity = document.getElementById('identity').value;
+                const username = document.getElementById('username').value.trim();
                 const password = document.getElementById('password').value;
 
-                const res = await fetch(`${API}/api/login`, {
+                if (!username || !password) {
+                    throw new Error('Enter username and password');
+                }
+
+                const res = await fetch(`${API}/auth/login`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ identity, password })
+                    body: JSON.stringify({ username, password })
                 });
 
-                if (!res.ok) throw new Error('Login failed - check credentials');
                 const data = await res.json();
-                authToken = data.token;
+                if (!res.ok) throw new Error(data.error || 'Login failed');
 
-                setStatus('authStatus', `✅ Logged in as ${identity}`, 'success');
+                authToken = data.token;
+                currentUser = data.username;
+
+                setStatus('authStatus', `✅ Logged in as ${currentUser}`, 'success');
+                document.getElementById('loginBox').style.display = 'none';
                 document.getElementById('channelsSection').style.display = 'block';
                 await loadChannels();
+                channelRefreshInterval = setInterval(loadChannels, 30000);
 
             } catch (err) {
                 setStatus('authStatus', `❌ ${err.message}`, 'error');
+            } finally {
+                btn.disabled = false;
             }
         }
 
+        // Allow Enter key to submit login
+        document.addEventListener('keydown', e => {
+            if (e.key === 'Enter' && !authToken) login();
+        });
+
         async function loadChannels() {
             try {
-                setStatus('status', '📡 Loading channels...', 'loading');
-
                 const res = await fetch(`${API}/api/channels`, {
                     headers: { 'Authorization': `Bearer ${authToken}` }
                 });
 
-                if (!res.ok) throw new Error('Failed to load channels');
+                if (!res.ok) {
+                    if (res.status === 401) {
+                        clearInterval(channelRefreshInterval);
+                        setStatus('status', '❌ Session expired — please reload and log in again', 'error');
+                        return;
+                    }
+                    throw new Error('Failed to load channels');
+                }
+
                 channels = await res.json();
-
                 document.getElementById('channelCount').textContent = `${channels.length} channels`;
-                setStatus('status', `✅ Found ${channels.length} channels`, 'success');
+                setStatus('status', `✅ ${channels.length} channels loaded`, 'success');
                 renderChannels();
-
-                // Auto-refresh channel list every 30s
-                setInterval(loadChannels, 30000);
 
             } catch (err) {
                 setStatus('status', `❌ ${err.message}`, 'error');
@@ -128,26 +152,27 @@
 
         function renderChannels() {
             const container = document.getElementById('channels');
-            const active = activeSessions.size;
 
             container.innerHTML = channels.map(ch => {
                 const isActive = activeSessions.has(ch.id);
                 const isLive = ch.liveCaller || ch.caller_state === 'phone';
-                const startTime = ch.starts_at ? new Date(ch.starts_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
+                const startTime = ch.starts_at
+                    ? new Date(ch.starts_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+                    : '';
 
                 return `
                     <div class="card ${isActive ? 'active' : ''} ${isLive && !isActive ? 'live' : ''}">
-                        <div class="card-title">${ch.display_name}</div>
+                        <div class="card-title">${escHtml(ch.display_name)}</div>
                         <div class="card-meta">
-                            ${ch.description ? `<span>📍 ${ch.description}</span>` : ''}
-                            ${ch.caller_name ? `<span>🎙️ ${ch.caller_name}</span>` : ''}
+                            ${ch.description ? `<span>📍 ${escHtml(ch.description)}</span>` : ''}
+                            ${ch.caller_name ? `<span>🎙️ ${escHtml(ch.caller_name)}</span>` : ''}
                             ${startTime ? `<span>🕐 ${startTime}</span>` : ''}
                         </div>
                         <div class="card-footer">
                             <span class="participants">👥 ${ch.participantCount || 0} listening</span>
                             ${isLive ? '<span class="live-badge">🔴 LIVE</span>' : ''}
-                            <button class="btn ${isActive ? 'stop' : ''}" 
-                                onclick="toggleChannel('${ch.id}', '${ch.display_name.replace(/'/g, '')}')">
+                            <button class="btn ${isActive ? 'stop' : ''}"
+                                onclick="toggleChannel(${JSON.stringify(ch.id)}, ${JSON.stringify(ch.display_name)})">
                                 ${isActive ? '⏹ Stop' : '▶ Listen'}
                             </button>
                         </div>
@@ -155,13 +180,19 @@
                 `;
             }).join('');
 
-            document.getElementById('activeCount').textContent = 
+            const active = activeSessions.size;
+            document.getElementById('activeCount').textContent =
                 active > 0 ? `🔊 Listening to ${active} channel${active > 1 ? 's' : ''} simultaneously` : '';
+        }
+
+        function escHtml(str) {
+            if (!str) return '';
+            return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
         }
 
         async function toggleChannel(channelId, channelName) {
             if (activeSessions.has(channelId)) {
-                await stopChannel(channelId);
+                await stopChannel(channelId, channelName);
             } else {
                 await startChannel(channelId, channelName);
             }
@@ -171,7 +202,6 @@
             try {
                 setStatus('status', `🎤 Connecting to ${channelName}...`, 'loading');
 
-                // Get LiveKit token
                 const res = await fetch(`${API}/api/session/start`, {
                     method: 'POST',
                     headers: {
@@ -181,34 +211,31 @@
                     body: JSON.stringify({ channel_id: channelId })
                 });
 
-                if (!res.ok) throw new Error('Failed to start session');
                 const session = await res.json();
+                if (!res.ok) throw new Error(session.error || 'Failed to start session');
+                if (!session.url || !session.token) throw new Error('No LiveKit URL/token in response');
 
-                // Connect to LiveKit room
-                const room = new LivekitClient.Room({
-                    adaptiveStream: true,
-                    dynacast: true
-                });
+                const room = new LivekitClient.Room({ adaptiveStream: true, dynacast: true });
 
-                room.on(LivekitClient.RoomEvent.TrackSubscribed, (track, pub, participant) => {
+                room.on(LivekitClient.RoomEvent.TrackSubscribed, (track) => {
                     if (track.kind === 'audio') {
                         const audioEl = track.attach();
                         audioEl.style.display = 'none';
+                        audioEl.dataset.channelId = channelId;
                         document.body.appendChild(audioEl);
-                        audioEl.play().catch(e => console.log('Autoplay blocked:', e));
+                        audioEl.play().catch(() => {});
                     }
                 });
 
                 room.on(LivekitClient.RoomEvent.Disconnected, () => {
                     console.log(`Disconnected from ${channelName}`);
-                    activeSessions.delete(channelId);
+                    cleanupSession(channelId);
                     renderChannels();
                 });
 
                 await room.connect(session.url, session.token);
                 console.log(`✅ Connected to ${channelName}`);
 
-                // Start heartbeat every 20s
                 const heartbeat = setInterval(async () => {
                     try {
                         await fetch(`${API}/api/session/heartbeat`, {
@@ -219,17 +246,10 @@
                             },
                             body: JSON.stringify({ session_id: session.session_id })
                         });
-                    } catch (e) {
-                        console.log('Heartbeat failed');
-                    }
+                    } catch {}
                 }, 20000);
 
-                activeSessions.set(channelId, {
-                    room,
-                    sessionId: session.session_id,
-                    heartbeat
-                });
-
+                activeSessions.set(channelId, { room, sessionId: session.session_id, heartbeat });
                 setStatus('status', `✅ Connected to ${channelName}`, 'success');
                 renderChannels();
 
@@ -238,7 +258,7 @@
             }
         }
 
-        async function stopChannel(channelId) {
+        async function stopChannel(channelId, channelName) {
             const session = activeSessions.get(channelId);
             if (!session) return;
 
@@ -255,15 +275,21 @@
                     body: JSON.stringify({ session_id: session.sessionId })
                 });
 
-                activeSessions.delete(channelId);
+                cleanupSession(channelId);
                 setStatus('status', '✅ Stopped', 'success');
                 renderChannels();
 
             } catch (err) {
                 console.error('Stop error:', err);
-                activeSessions.delete(channelId);
+                cleanupSession(channelId);
                 renderChannels();
             }
+        }
+
+        function cleanupSession(channelId) {
+            activeSessions.delete(channelId);
+            // Remove detached audio elements for this channel
+            document.querySelectorAll(`audio[data-channel-id="${channelId}"]`).forEach(el => el.remove());
         }
     </script>
 </body>

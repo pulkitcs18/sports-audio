@@ -179,9 +179,12 @@ app.use((req, res, next) => {
   res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
   // connect-src wss: covers any LiveKit SFU domain (we don't know it at build time).
   // unsafe-inline for style-src is required because all CSS is inline in the HTML.
+  // unsafe-inline is required for both script-src and style-src because all JS and CSS
+  // live inline in the HTML. The main CSP value here is blocking external script hosts
+  // (only 'self' and cdn.jsdelivr.net allowed) and preventing framing (frame-ancestors).
   res.setHeader('Content-Security-Policy',
     "default-src 'self'; " +
-    "script-src 'self' cdn.jsdelivr.net; " +
+    "script-src 'self' cdn.jsdelivr.net 'unsafe-inline'; " +
     "connect-src 'self' wss:; " +
     "media-src blob:; " +
     "style-src 'self' 'unsafe-inline'; " +

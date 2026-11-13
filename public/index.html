@@ -313,7 +313,6 @@ input[type=range].vol::-moz-range-thumb{
           </div>
           <div class="filter-tabs">
             <button class="filter-btn active" onclick="setFilter('all',this)">All</button>
-            <button class="filter-btn" onclick="setFilter('audio',this)">Audio</button>
             <button class="filter-btn" onclick="setFilter('live',this)"><div class="dot"></div>LIVE ONLY</button>
           </div>
         </div>
@@ -436,9 +435,9 @@ async function doLogin() {
   finally{ btn.disabled=false; btn.textContent='SIGN IN'; }
 }
 
-function signOut() {
+async function signOut() {
   clearInterval(channelRefreshTimer);
-  activeSessions.forEach((_,id)=>stopChannel(id));
+  await Promise.all([...activeSessions.keys()].map(id=>stopChannel(id)));
   authToken=null; currentUser=null; channels=[];
   document.getElementById('app').style.display='none';
   document.getElementById('loginPage').style.display='flex';
@@ -733,6 +732,9 @@ async function startChannel(channelId, channelName) {
 
   } catch(e) {
     showToast(e.message || 'Connection failed', 'error');
+    // Disconnect the room if it was partially connected before the error
+    const failedSess = activeSessions.get(channelId);
+    if (failedSess) { try { failedSess.room.disconnect(); } catch(_){} }
     _cleanupSession(channelId);
     if(btn){btn.disabled=false;}
   }

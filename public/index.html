@@ -468,6 +468,13 @@ function setFilter(f,el) {
 function renderChannels() {
   const q=document.getElementById('searchInput').value.toLowerCase();
   let list=channels;
+  // Hide games that ended more than 4 hours ago (not live and start time is old)
+  const cutoff = Date.now() - 4 * 60 * 60 * 1000;
+  list = list.filter(ch => {
+    if (ch.liveCaller || ch.caller_state === 'phone') return true; // always show live
+    if (!ch.starts_at) return true; // no time info, keep it
+    return new Date(ch.starts_at).getTime() > cutoff;
+  });
   if(currentFilter==='live') list=list.filter(ch=>ch.liveCaller||ch.caller_state==='phone');
   if(q) list=list.filter(ch=>(ch.display_name||'').toLowerCase().includes(q)||(ch.caller_name||'').toLowerCase().includes(q)||(ch.description||'').toLowerCase().includes(q));
 

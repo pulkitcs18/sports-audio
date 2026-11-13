@@ -18,7 +18,7 @@ const STEVE_PASSWORD  = process.env.STEVE_PASSWORD;
 const JWT_SECRET      = process.env.JWT_SECRET;
 const ADMIN_USERNAME  = process.env.ADMIN_USERNAME;
 const ADMIN_PASSWORD  = process.env.ADMIN_PASSWORD;
-// Comma-separated list of allowed origins, e.g. "https://sportsaudio.dev,http://localhost:3000"
+// Comma-separated allowed origins, e.g. "https://sportsaudio.dev,http://localhost:3000"
 const CORS_ORIGINS    = (process.env.CORS_ORIGINS || 'http://localhost:3000').split(',').map(s => s.trim());
 
 for (const [k, v] of Object.entries({
@@ -27,6 +27,10 @@ for (const [k, v] of Object.entries({
 })) {
   if (!v) { console.error(`Missing required env var: ${k}`); process.exit(1); }
 }
+
+// Pre-compute a valid dummy hash used for constant-time login (prevents username enumeration).
+// bcrypt.compareSync on an invalid hash format throws; using a real hash keeps timing uniform.
+const DUMMY_HASH = bcrypt.hashSync('__dummy_timing_placeholder__', 10);
 
 // ── SQLite ────────────────────────────────────────────────────────────────
 const db = new Database(path.join(__dirname, 'users.db'));
@@ -38,7 +42,6 @@ db.exec(`CREATE TABLE IF NOT EXISTS users (
   full_access   INTEGER NOT NULL DEFAULT 0
 )`);
 
-// Migrate: add full_access column if upgrading from older schema
 const cols = db.prepare('PRAGMA table_info(users)').all();
 if (!cols.find(c => c.name === 'full_access')) {
   db.exec('ALTER TABLE users ADD COLUMN full_access INTEGER NOT NULL DEFAULT 0');
@@ -59,15 +62,15 @@ db.exec(`CREATE TABLE IF NOT EXISTS sessions (
 )`);
 
 // Seed family accounts — passwords come from env vars, NOT hardcoded here.
-// Set SEED_HARSHIT_PW, SEED_PRIYA_PW, etc. in .env or skip seeding entirely.
+// Set SEED_HARSHIT_PW, SEED_PRIYA_PW, etc. in .env
 const SEED_USERS = [
-  { username: 'harshit', envKey: 'SEED_HARSHIT_PW'  },
-  { username: 'priya',   envKey: 'SEED_PRIYA_PW'    },
-  { username: 'rahul',   envKey: 'SEED_RAHUL_PW'    },
-  { username: 'anita',   envKey: 'SEED_ANITA_PW'    },
-  { username: 'vikram',  envKey: 'SEED_VIKRAM_PW'   },
+  { username: 'harshit', envKey: 'SEED_HARSHIT_PW' },
+  { username: 'priya',   envKey: 'SEED_PRIYA_PW'   },
+  { username: 'rahul',   envKey: 'SEED_RAHUL_PW'   },
+  { username: 'anita',   envKey: 'SEED_ANITA_PW'   },
+  { username: 'vikram',  envKey: 'SEED_VIKRAM_PW'  },
 ];
-const insertUser     = db.prepare('INSERT OR IGNORE INTO users (username, password_hash, full_access) VALUES (?, ?, 1)');
+const insertUser      = db.prepare('INSERT OR IGNORE INTO users (username, password_hash, full_access) VALUES (?, ?, 1)');
 const grantFullAccess = db.prepare('UPDATE users SET full_access = 1 WHERE username = ?');
 for (const u of SEED_USERS) {
   const pw = process.env[u.envKey];
@@ -77,6 +80,37 @@ for (const u of SEED_USERS) {
   }
 }
 console.log('✅ SQLite users ready');
+
+// ── Per-account login failure tracking ───────────────────────────────────
+// Prevents credential stuffing via IP rotation — each account locks after 5 failures.
+// In-memory only (resets on restart), which is fine for a single-process deployment.
+const loginFailures = new Map(); // username -> { count, lockedUntil }
+const LOGIN_MAX_FAILURES  = 5;
+const LOGIN_LOCKOUT_MS    = 15 * 60 * 1000; // 15 minutes
+
+function checkLoginLock(username) {
+  const rec = loginFailures.get(username);
+  if (!rec) return null; // no failures
+  if (rec.lockedUntil && Date.now() < rec.lockedUntil) {
+    const mins = Math.ceil((rec.lockedUntil - Date.now()) / 60000);
+    return `Account locked after too many failed attempts. Try again in ${mins} minute${mins !== 1 ? 's' : ''}.`;
+  }
+  return null;
+}
+
+function recordLoginFailure(username) {
+  const rec = loginFailures.get(username) || { count: 0, lockedUntil: null };
+  rec.count += 1;
+  if (rec.count >= LOGIN_MAX_FAILURES) {
+    rec.lockedUntil = Date.now() + LOGIN_LOCKOUT_MS;
+    console.warn(`🔒 Account locked: ${username} (${rec.count} failures)`);
+  }
+  loginFailures.set(username, rec);
+}
+
+function clearLoginFailures(username) {
+  loginFailures.delete(username);
+}
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -122,10 +156,14 @@ async function getSteveToken() {
 // ── Express ───────────────────────────────────────────────────────────────
 const app = express();
 
+// Trust exactly one proxy hop (Nginx). Without this, req.ip is always 127.0.0.1
+// and rate limiting either blocks everyone or can be trivially spoofed via X-Forwarded-For.
+// If you add Cloudflare in front of Nginx later, change this to 2.
+app.set('trust proxy', 1);
+
 // CORS: only allow our own domain(s)
 app.use(cors({
   origin: (origin, cb) => {
-    // Allow requests with no origin (same-origin browser requests, curl, Postman)
     if (!origin || CORS_ORIGINS.includes(origin)) return cb(null, true);
     cb(new Error(`CORS: origin ${origin} not allowed`));
   },
@@ -133,11 +171,31 @@ app.use(cors({
 }));
 
 app.use(express.json({ limit: '16kb' }));
+
+// ── Security headers ──────────────────────────────────────────────────────
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  // connect-src wss: covers any LiveKit SFU domain (we don't know it at build time).
+  // unsafe-inline for style-src is required because all CSS is inline in the HTML.
+  res.setHeader('Content-Security-Policy',
+    "default-src 'self'; " +
+    "script-src 'self' cdn.jsdelivr.net; " +
+    "connect-src 'self' wss:; " +
+    "media-src blob:; " +
+    "style-src 'self' 'unsafe-inline'; " +
+    "img-src 'self' data:; " +
+    "frame-ancestors 'none'"
+  );
+  next();
+});
+
 app.use(express.static(path.join(__dirname, 'public')));
 
 // ── Rate limiting ─────────────────────────────────────────────────────────
 
-// Strict limit on login: 10 attempts per 15 minutes per IP
+// Login: 10 attempts per 15 min per IP (combined with per-account lock above)
 const loginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10,
@@ -146,13 +204,22 @@ const loginLimiter = rateLimit({
   message: { error: 'Too many login attempts. Try again in 15 minutes.' },
 });
 
-// General API limit: 200 req/min per IP (protects against scraping)
+// General API: 200 req/min per IP
 const apiLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: 200,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many requests.' },
+});
+
+// Session creation: 5 per 60 sec per IP — prevents mass LiveKit token generation
+const sessionLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many session requests. Wait a moment.' },
 });
 
 app.use('/api/', apiLimiter);
@@ -165,7 +232,8 @@ function requireAuth(req, res, next) {
   const token  = header.startsWith('Bearer ') ? header.slice(7) : header;
   if (!token) return res.status(401).json({ error: 'Missing token' });
   try {
-    const decoded = jwt.verify(token, JWT_SECRET);
+    // Pin algorithm to prevent alg:none and RS256-confusion attacks
+    const decoded = jwt.verify(token, JWT_SECRET, { algorithms: ['HS256'] });
     if (decoded.role === 'admin') return res.status(403).json({ error: 'Use user token' });
     if (!decoded.sessionId) return res.status(401).json({ error: 'Invalid token format' });
 
@@ -174,7 +242,6 @@ function requireAuth(req, res, next) {
       .get(decoded.sessionId, decoded.userId);
     if (!sess) return res.status(401).json({ error: 'Session expired — please log in again' });
 
-    // Update last_seen
     db.prepare('UPDATE sessions SET last_seen = ? WHERE id = ?').run(Date.now(), decoded.sessionId);
     req.user = decoded;
     next();
@@ -186,7 +253,7 @@ function requireAdmin(req, res, next) {
   const token  = header.startsWith('Bearer ') ? header.slice(7) : header;
   if (!token) return res.status(401).json({ error: 'Missing token' });
   try {
-    const decoded = jwt.verify(token, JWT_SECRET);
+    const decoded = jwt.verify(token, JWT_SECRET, { algorithms: ['HS256'] });
     if (decoded.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
     req.admin = decoded;
     next();
@@ -200,17 +267,36 @@ app.post('/auth/login', loginLimiter, (req, res) => {
   try {
     const { username, password } = req.body;
     if (!username || !password) return res.status(400).json({ error: 'Username and password required' });
+
+    // Reject excessively long passwords before hitting bcrypt (bcrypt truncates at 72 bytes,
+    // and large inputs burn CPU — this caps it safely)
+    if (typeof password !== 'string' || password.length > 128)
+      return res.status(400).json({ error: 'Invalid credentials' });
+
+    // Per-account lockout check
+    const lockMsg = checkLoginLock(username);
+    if (lockMsg) return res.status(429).json({ error: lockMsg });
+
     const user = db.prepare('SELECT * FROM users WHERE username = ?').get(username);
-    // Always run bcrypt compare to prevent timing-based username enumeration
-    const hash = user ? user.password_hash : '$2a$10$invalidhashfortimingnormalization';
+
+    // Always run bcrypt to prevent timing-based username enumeration
+    const hash  = user ? user.password_hash : DUMMY_HASH;
     const valid = bcrypt.compareSync(password, hash);
-    if (!user || !valid) return res.status(401).json({ error: 'Invalid credentials' });
+
+    if (!user || !valid) {
+      recordLoginFailure(username);
+      // Log failed attempt for monitoring
+      console.warn(`⛔ Failed login: ${username} | IP: ${req.ip} | UA: ${req.headers['user-agent']}`);
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+    // Success — clear any failure record
+    clearLoginFailures(username);
 
     // One active session per user — kill all previous sessions (logs out other devices)
     const killed = db.prepare('DELETE FROM sessions WHERE user_id = ?').run(user.id).changes;
     if (killed > 0) console.log(`⚠️  Killed ${killed} existing session(s) for ${user.username}`);
 
-    // Create new session
     const sessionId = crypto.randomBytes(32).toString('hex');
     db.prepare('INSERT INTO sessions (id, user_id, created_at, last_seen) VALUES (?, ?, ?, ?)')
       .run(sessionId, user.id, Date.now(), Date.now());
@@ -220,7 +306,8 @@ app.post('/auth/login', loginLimiter, (req, res) => {
       JWT_SECRET,
       { expiresIn: '7d' }
     );
-    console.log(`✅ Login: ${username}`);
+
+    console.log(`✅ Login: ${username} | IP: ${req.ip} | UA: ${req.headers['user-agent']}`);
     res.json({ token, username: user.username });
   } catch (err) { console.error('Login error:', err); res.status(500).json({ error: 'Server error' }); }
 });
@@ -237,6 +324,8 @@ app.post('/auth/change-password', requireAuth, (req, res) => {
   try {
     const { currentPassword, newPassword } = req.body;
     if (!currentPassword || !newPassword) return res.status(400).json({ error: 'Missing fields' });
+    if (typeof newPassword !== 'string' || newPassword.length > 128)
+      return res.status(400).json({ error: 'Invalid password' });
     if (newPassword.length < 8) return res.status(400).json({ error: 'New password must be at least 8 characters' });
     const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user.userId);
     if (!user || !bcrypt.compareSync(currentPassword, user.password_hash))
@@ -244,6 +333,7 @@ app.post('/auth/change-password', requireAuth, (req, res) => {
     db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(bcrypt.hashSync(newPassword, 10), user.id);
     // Invalidate ALL sessions — force re-login on every device
     db.prepare('DELETE FROM sessions WHERE user_id = ?').run(user.id);
+    clearLoginFailures(user.username);
     console.log(`✅ Password changed: ${user.username}`);
     res.json({ ok: true });
   } catch (err) { res.status(500).json({ error: 'Server error' }); }
@@ -256,7 +346,7 @@ app.post('/admin/login', loginLimiter, (req, res) => {
   if (username !== ADMIN_USERNAME || password !== ADMIN_PASSWORD)
     return res.status(401).json({ error: 'Invalid admin credentials' });
   const token = jwt.sign({ role: 'admin', username }, JWT_SECRET, { expiresIn: '8h' });
-  console.log(`✅ Admin login: ${username}`);
+  console.log(`✅ Admin login: ${username} | IP: ${req.ip}`);
   res.json({ token });
 });
 
@@ -276,7 +366,8 @@ app.post('/admin/users', requireAdmin, (req, res) => {
   try {
     const { username, password } = req.body;
     if (!username || !password) return res.status(400).json({ error: 'Username and password required' });
-    if (password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
+    if (typeof password !== 'string' || password.length > 128 || password.length < 8)
+      return res.status(400).json({ error: 'Password must be 8–128 characters' });
     const hash = bcrypt.hashSync(password, 10);
     const result = db.prepare('INSERT INTO users (username, password_hash, full_access) VALUES (?, ?, 0)').run(username, hash);
     console.log(`✅ Admin created user: ${username}`);
@@ -297,17 +388,17 @@ app.delete('/admin/users/:id', requireAdmin, (req, res) => {
 
 app.post('/admin/users/:id/reset-password', requireAdmin, (req, res) => {
   const { password } = req.body;
-  if (!password || password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
+  if (!password || typeof password !== 'string' || password.length < 8 || password.length > 128)
+    return res.status(400).json({ error: 'Password must be 8–128 characters' });
   const user = db.prepare('SELECT username FROM users WHERE id = ?').get(req.params.id);
   if (!user) return res.status(404).json({ error: 'User not found' });
   db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(bcrypt.hashSync(password, 10), req.params.id);
-  // Kill active sessions — force re-login
   db.prepare('DELETE FROM sessions WHERE user_id = ?').run(req.params.id);
+  clearLoginFailures(user.username);
   console.log(`✅ Admin reset password for: ${user.username}`);
   res.json({ ok: true });
 });
 
-// Kick user: kill their session so they're logged out immediately
 app.post('/admin/users/:id/kick', requireAdmin, (req, res) => {
   const user = db.prepare('SELECT username FROM users WHERE id = ?').get(req.params.id);
   if (!user) return res.status(404).json({ error: 'User not found' });
@@ -368,8 +459,8 @@ app.get('/api/channels', requireAuth, async (req, res) => {
   }
 });
 
-// POST /api/session — returns LiveKit credentials for browser-side WebRTC connection
-app.post('/api/session', requireAuth, async (req, res) => {
+// POST /api/session — returns LiveKit credentials for browser WebRTC connection
+app.post('/api/session', sessionLimiter, requireAuth, async (req, res) => {
   try {
     const { channelId } = req.body;
     if (!channelId || typeof channelId !== 'string' || channelId.length > 200)
@@ -377,7 +468,7 @@ app.post('/api/session', requireAuth, async (req, res) => {
 
     const allowed = getAllowedChannels(req.user.userId);
     if (allowed !== null && !allowed.includes(channelId)) {
-      console.warn(`⛔ ${req.user.username} denied access to channel ${channelId}`);
+      console.warn(`⛔ ${req.user.username} denied access to channel ${channelId} | IP: ${req.ip}`);
       return res.status(403).json({ error: 'Access denied for this channel' });
     }
 
@@ -388,7 +479,7 @@ app.post('/api/session', requireAuth, async (req, res) => {
       { headers: { 'Authorization': `Bearer ${token}`, 'x-device-id': DEVICE_ID, 'Content-Type': 'application/json' } }
     );
 
-    console.log(`🎵 ${req.user.username} joined channel ${channelId}`);
+    console.log(`🎵 ${req.user.username} joined channel ${channelId} | IP: ${req.ip}`);
     res.json({ token: data.token, url: data.url, sessionId: data.session_id });
   } catch (err) {
     console.error('Session error:', err.message);

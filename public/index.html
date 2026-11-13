@@ -4,7 +4,9 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>HUB — Sports Audio</title>
-<script src="https://cdn.jsdelivr.net/npm/livekit-client@2.5.0/dist/livekit-client.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/livekit-client@2.5.0/dist/livekit-client.umd.min.js"
+        integrity="sha384-J07cdkayEiYMw+o91SMzocx7RQmD6tXqkFD8TZkuwRzC2xuEDEHwT7GSyarKHQcD"
+        crossorigin="anonymous"></script>
 <style>
 :root {
   --bg:#0e0e0f; --sidebar:#131315; --card:#1a1a1e; --card-hover:#202026;
@@ -390,7 +392,7 @@ input[type=range].vol::-moz-range-thumb{
 
 <script>
 const API = window.location.origin;
-let authToken = null, currentUser = null;
+let authToken = null;
 let channels = [];
 // activeSessions: id -> { room, audioCtx, gain, _elements, muted, volume, name, _stopping }
 let activeSessions = new Map();
@@ -426,7 +428,7 @@ async function doLogin() {
     const res=await fetch(`${API}/auth/login`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username,password})});
     const data=await res.json();
     if(!res.ok) throw new Error(data.error||'Login failed');
-    authToken=data.token; currentUser=data.username;
+    authToken=data.token;
     document.getElementById('loginPage').style.display='none';
     document.getElementById('app').style.display='flex';
     await loadChannels();
@@ -442,7 +444,7 @@ async function signOut(reason) {
   if (authToken) {
     fetch(`${API}/auth/logout`, { method:'POST', headers:{ 'Authorization':`Bearer ${authToken}` } }).catch(()=>{});
   }
-  authToken=null; currentUser=null; channels=[];
+  authToken=null; channels=[];
   document.getElementById('app').style.display='none';
   document.getElementById('loginPage').style.display='flex';
   const errEl = document.getElementById('loginErr');
@@ -677,6 +679,7 @@ async function startChannel(channelId, channelName) {
       body: JSON.stringify({ channelId })
     });
     const data = await res.json();
+    if(res.status === 401) { signOut('Your session was ended. Please sign in again.'); return; }
     if(!res.ok) throw new Error(data.error || 'Failed to get session');
 
     const { token, url } = data;
@@ -776,7 +779,8 @@ async function changePassword() {
   msg.textContent=''; msg.className='modal-msg';
   if(!cur||!nw||!cf){msg.textContent='All fields required.';msg.classList.add('err');return;}
   if(nw!==cf){msg.textContent='New passwords do not match.';msg.classList.add('err');return;}
-  if(nw.length<6){msg.textContent='Password must be at least 6 characters.';msg.classList.add('err');return;}
+  if(nw.length<8){msg.textContent='Password must be at least 8 characters.';msg.classList.add('err');return;}
+  if(nw.length>128){msg.textContent='Password must be 128 characters or fewer.';msg.classList.add('err');return;}
   try {
     const res=await fetch(`${API}/auth/change-password`,{
       method:'POST',headers:{'Authorization':`Bearer ${authToken}`,'Content-Type':'application/json'},

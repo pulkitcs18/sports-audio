@@ -479,14 +479,30 @@ function renderChannels() {
   if(!list.length){grid.innerHTML='';empty.style.display='flex';document.getElementById('emptyMsg').textContent=channels.length===0?'No games found. Check back later or hit Refresh.':'No channels match your search.';return;}
   empty.style.display='none';
 
+  // Active first, then live, then sort by starts_at ascending
   list.sort((a,b)=>{
-    const s=x=>(activeSessions.has(x.id)?2:0)+((x.liveCaller||x.caller_state==='phone')?1:0);
-    return s(b)-s(a);
+    const score=x=>(activeSessions.has(x.id)?4:0)+((x.liveCaller||x.caller_state==='phone')?2:0);
+    const sd=score(b)-score(a);
+    if(sd!==0) return sd;
+    const ta=a.starts_at?new Date(a.starts_at).getTime():Infinity;
+    const tb=b.starts_at?new Date(b.starts_at).getTime():Infinity;
+    return ta-tb;
   });
 
   grid.innerHTML=list.map(ch=>{
     const isActive=activeSessions.has(ch.id);
     const isLive=ch.liveCaller||ch.caller_state==='phone';
+    let timeStr='';
+    if(ch.starts_at){
+      const d=new Date(ch.starts_at);
+      const today=new Date();
+      const isToday=d.toDateString()===today.toDateString();
+      const tmrw=new Date(today); tmrw.setDate(today.getDate()+1);
+      const isTomorrow=d.toDateString()===tmrw.toDateString();
+      const dayLabel=isToday?'Today':isTomorrow?'Tomorrow':d.toLocaleDateString([],{weekday:'short',month:'short',day:'numeric'});
+      const timePart=d.toLocaleTimeString([],{hour:'numeric',minute:'2-digit'});
+      timeStr=`${dayLabel} · ${timePart}`;
+    }
     return `<div class="channel-card ${isActive?'is-active':''} ${isLive&&!isActive?'is-live':''}">
       <div class="card-top">
         <div class="card-name">${esc(ch.display_name)}</div>
@@ -495,6 +511,7 @@ function renderChannels() {
           ${isLive&&!isActive?'<span class="badge badge-live">LIVE</span>':''}
         </div>
       </div>
+      ${timeStr?`<div style="font-size:.72rem;color:var(--muted);font-family:var(--mono);letter-spacing:.3px;">${esc(timeStr)}</div>`:''}
       <div class="card-footer">
         <button class="btn-listen ${isActive?'stop':'listen'}" id="btn-${esc(ch.id)}"
           onclick="toggleChannel(${JSON.stringify(ch.id)},${JSON.stringify(ch.display_name)})">

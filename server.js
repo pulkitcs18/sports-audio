@@ -1,14 +1,11 @@
 require('dotenv').config();
 const express      = require('express');
-const http         = require('http');
-const { WebSocketServer } = require('ws');
 const axios        = require('axios');
 const cors         = require('cors');
 const path         = require('path');
 const Database     = require('better-sqlite3');
 const bcrypt       = require('bcryptjs');
 const jwt          = require('jsonwebtoken');
-const RelayManager = require('./relay-manager');
 
 // ── Env validation ────────────────────────────────────────────────────────
 const BASE_URL        = 'https://stevesrodeo.com';
@@ -109,9 +106,6 @@ async function getSteveToken() {
 
   return steveTokenRefreshPromise;
 }
-
-// ── Relay manager ─────────────────────────────────────────────────────────
-const relay = new RelayManager({ getSteveToken, deviceId: DEVICE_ID, baseUrl: BASE_URL });
 
 // ── Express ───────────────────────────────────────────────────────────────
 const app = express();
@@ -291,6 +285,36 @@ app.get('/api/channels', requireAuth, async (req, res) => {
   }
 });
 
+// POST /api/session — proxy to Steve's Rodeo session/start, return LiveKit credentials
+// Browser uses these to connect directly to LiveKit (sub-300ms latency)
+app.post('/api/session', requireAuth, async (req, res) => {
+  try {
+    const { channelId } = req.body;
+    if (!channelId) return res.status(400).json({ error: 'channelId required' });
+
+    // Enforce channel access
+    const allowed = getAllowedChannels(req.user.userId);
+    if (allowed !== null && !allowed.includes(channelId)) {
+      console.warn(`⛔ ${req.user.username} denied access to channel ${channelId}`);
+      return res.status(403).json({ error: 'Access denied for this channel' });
+    }
+
+    const token = await getSteveToken();
+    const { data } = await axios.post(
+      `${BASE_URL}/api/session/start`,
+      { channel_id: channelId, device_id: DEVICE_ID },
+      { headers: { 'Authorization': `Bearer ${token}`, 'x-device-id': DEVICE_ID, 'Content-Type': 'application/json' } }
+    );
+
+    console.log(`🎵 ${req.user.username} joined channel ${channelId}`);
+    // data contains { session_id, token (LiveKit JWT), url (LiveKit WS URL) }
+    res.json({ token: data.token, url: data.url, sessionId: data.session_id });
+  } catch (err) {
+    console.error('Session error:', err.message);
+    res.status(err.response?.status || 500).json({ error: err.message });
+  }
+});
+
 // Catch-all: serve index.html for all non-API, non-admin routes
 app.get('*', (req, res) => {
   if (req.path.startsWith('/admin')) {
@@ -299,58 +323,16 @@ app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-// ── HTTP + WebSocket server ───────────────────────────────────────────────
-const server = http.createServer(app);
-const wss    = new WebSocketServer({ noServer: true });
-
-server.on('upgrade', (request, socket, head) => {
-  let url;
-  try { url = new URL(request.url, `http://${request.headers.host}`); }
-  catch { socket.destroy(); return; }
-
-  const match = url.pathname.match(/^\/ws\/channel\/([^/]+)$/);
-  if (!match) { socket.destroy(); return; }
-
-  const channelId = decodeURIComponent(match[1]);
-  const rawToken  = url.searchParams.get('token');
-
-  let user;
-  try { user = jwt.verify(rawToken, JWT_SECRET); }
-  catch { socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n'); socket.destroy(); return; }
-
-  if (user.role === 'admin') {
-    socket.write('HTTP/1.1 403 Forbidden\r\n\r\n'); socket.destroy(); return;
-  }
-
-  // Enforce channel access control
-  const allowed = getAllowedChannels(user.userId);
-  if (allowed !== null && !allowed.includes(channelId)) {
-    console.warn(`⛔ ${user.username} denied access to channel ${channelId}`);
-    socket.write('HTTP/1.1 403 Forbidden\r\n\r\n'); socket.destroy(); return;
-  }
-
-  wss.handleUpgrade(request, socket, head, (ws) => {
-    ws._user = user;
-    console.log(`🔌 ${user.username} joined channel ${channelId}`);
-    relay.addListener(channelId, ws).catch(err => {
-      console.error('addListener error:', err.message);
-      ws.close(1011, 'Server error');
-    });
-  });
-});
-
 // ── Graceful shutdown ─────────────────────────────────────────────────────
-async function shutdown(signal) {
+function shutdown(signal) {
   console.log(`\n${signal} received — shutting down…`);
-  await relay.shutdown();
-  server.close(() => { console.log('HTTP server closed'); process.exit(0); });
-  setTimeout(() => process.exit(1), 10_000);
+  process.exit(0);
 }
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT',  () => shutdown('SIGINT'));
 
 // ── Start ─────────────────────────────────────────────────────────────────
-server.listen(PORT, () => {
+app.listen(PORT, () => {
   console.log(`\n✅ Sports Audio server running at http://localhost:${PORT}\n`);
   getSteveToken().catch(err => console.error("Initial Steve's token fetch failed:", err.message));
 });

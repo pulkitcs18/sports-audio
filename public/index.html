@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>HUB — Sports Audio</title>
-<!-- No LiveKit client needed — audio comes via WebSocket from our server relay -->
+<script src="https://cdn.jsdelivr.net/npm/livekit-client@2.5.0/dist/livekit-client.umd.min.js"></script>
 <style>
 :root {
   --bg:#0e0e0f; --sidebar:#131315; --card:#1a1a1e; --card-hover:#202026;
@@ -393,13 +393,28 @@ input[type=range].vol::-moz-range-thumb{
 const API = window.location.origin;
 let authToken = null, currentUser = null;
 let channels = [];
-let activeSessions = new Map(); // id -> {ws, audioCtx, worklet, gain, muted, volume, name, callerName, _stopping}
+// activeSessions: id -> { room, audioCtx, gain, _elements, muted, volume, name, _stopping }
+let activeSessions = new Map();
 let currentFilter = 'all';
 let channelRefreshTimer = null;
 let playerCollapsed = false;
-let allMuted = false;
 
-// ─── Login ──────────────────────────────────────────────────────────────
+// ─── Utilities ────────────────────────────────────────────────────────────────
+function esc(s) {
+  return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+let _toastTimer;
+function showToast(msg, type='info') {
+  const t=document.getElementById('toast'), d=document.getElementById('tdot'), m=document.getElementById('tmsg');
+  d.style.background = type==='success'?'var(--green)':type==='error'?'var(--red)':'var(--accent)';
+  m.textContent = msg;
+  t.classList.add('show');
+  clearTimeout(_toastTimer);
+  _toastTimer = setTimeout(()=>t.classList.remove('show'), 3500);
+}
+
+// ─── Login ────────────────────────────────────────────────────────────────────
 document.addEventListener('keydown', e => { if(e.key==='Enter'&&!authToken) doLogin(); });
 
 async function doLogin() {
@@ -431,7 +446,7 @@ function signOut() {
   document.getElementById('lp').value='';
 }
 
-// ─── Navigation ──────────────────────────────────────────────────────────
+// ─── Navigation ───────────────────────────────────────────────────────────────
 function showView(name) {
   document.querySelectorAll('.view').forEach(v=>v.classList.remove('active'));
   document.querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));
@@ -440,7 +455,7 @@ function showView(name) {
   if(name==='schedule') renderSchedule();
 }
 
-// ─── Channels ────────────────────────────────────────────────────────────
+// ─── Channels ─────────────────────────────────────────────────────────────────
 async function loadChannels(manual=false) {
   if(manual){
     const b=document.getElementById('refreshBtn');
@@ -449,9 +464,6 @@ async function loadChannels(manual=false) {
   }
   try {
     const res=await fetch(`${API}/api/channels`,{headers:{'Authorization':`Bearer ${authToken}`}});
-    // On 401 from a background poll: do NOT sign out — the WebSocket sessions are still alive
-    // and kicking users out mid-game would be worse than stale channel data.
-    // 401 only triggers signout if the user explicitly acts (handled by requireAuth elsewhere).
     if(!res.ok) return;
     channels=await res.json();
     renderChannels(); renderSchedule();
@@ -468,15 +480,17 @@ function setFilter(f,el) {
 function renderChannels() {
   const q=document.getElementById('searchInput').value.toLowerCase();
   let list=channels;
+
   // Hide games that ended more than 4 hours ago (not live and start time is old)
   const cutoff = Date.now() - 4 * 60 * 60 * 1000;
   list = list.filter(ch => {
-    if (ch.liveCaller || ch.caller_state === 'phone') return true; // always show live
-    if (!ch.starts_at) return true; // no time info, keep it
+    if (ch.liveCaller || ch.caller_state === 'phone') return true;
+    if (!ch.starts_at) return true;
     return new Date(ch.starts_at).getTime() > cutoff;
   });
+
   if(currentFilter==='live') list=list.filter(ch=>ch.liveCaller||ch.caller_state==='phone');
-  if(q) list=list.filter(ch=>(ch.display_name||'').toLowerCase().includes(q)||(ch.caller_name||'').toLowerCase().includes(q)||(ch.description||'').toLowerCase().includes(q));
+  if(q) list=list.filter(ch=>(ch.display_name||'').toLowerCase().includes(q)||(ch.description||'').toLowerCase().includes(q));
 
   const liveCount=channels.filter(ch=>ch.liveCaller||ch.caller_state==='phone').length;
   document.getElementById('availText').textContent=`${liveCount} AVAILABLE`;
@@ -549,7 +563,7 @@ function renderSchedule() {
   `).join('');
 }
 
-// ─── Player bar ───────────────────────────────────────────────────────────
+// ─── Player bar ───────────────────────────────────────────────────────────────
 function updatePlayer() {
   const bar=document.getElementById('playerBar');
   const rows=document.getElementById('playerRows');
@@ -566,8 +580,6 @@ function updatePlayer() {
   document.getElementById('muteAllBtn').textContent=allM?'Unmute all':'Mute all';
 
   rows.innerHTML=[...activeSessions.entries()].map(([id,sess])=>{
-    const ch=channels.find(c=>c.id===id)||{};
-    const isLive=ch.liveCaller||ch.caller_state==='phone';
     const vol=Math.round((sess.volume??1)*100);
     return `<div class="player-row" id="prow-${esc(id)}">
       <button class="mute-btn ${sess.muted?'muted':''}" onclick="toggleMute(${JSON.stringify(id)})">
@@ -624,7 +636,6 @@ function popOut() {
   const rows=[...activeSessions.values()].map(s=>`
     <div style="display:flex;align-items:center;gap:12px;padding:12px 16px;border-bottom:1px solid #2a2a30">
       <span style="min-width:120px;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(s.name)}</span>
-      <span style="font-size:11px;color:#71717a">${s.callerName||''}</span>
     </div>`).join('');
   w.document.write(`<!DOCTYPE html><html><head><title>Player</title>
   <style>body{margin:0;background:#0e0e0f;color:#e4e4e7;font-family:sans-serif;}
@@ -632,165 +643,139 @@ function popOut() {
   </head><body><h3>🎙 ${activeSessions.size} channel${activeSessions.size>1?'s':''} playing</h3>${rows}</body></html>`);
 }
 
-// ─── Session control ──────────────────────────────────────────────────────
+// ─── Session control (LiveKit browser SDK) ────────────────────────────────────
 async function toggleChannel(id,name){activeSessions.has(id)?await stopChannel(id):await startChannel(id,name);}
 
+function _cleanupSession(channelId) {
+  const sess = activeSessions.get(channelId);
+  if (!sess) return;
+  sess._elements.forEach(el => { try { el.remove(); } catch(_){} });
+  try { sess.audioCtx.close(); } catch(_){}
+  activeSessions.delete(channelId);
+  renderChannels(); updatePlayer();
+}
+
 async function startChannel(channelId, channelName) {
-  if(activeSessions.has(channelId)) return; // already running
+  if(activeSessions.has(channelId)) return;
   const btn=document.getElementById('btn-'+channelId);
   if(btn){btn.disabled=true;btn.innerHTML='…';}
 
-  const ch=channels.find(c=>c.id===channelId)||{};
-
-  // Build AudioContext + AudioWorklet + GainNode chain
-  let audioCtx, worklet, gain;
   try {
-    audioCtx = new AudioContext({ sampleRate: 48000 });
-    if(audioCtx.state === 'suspended') await audioCtx.resume();
-    await audioCtx.audioWorklet.addModule('/worklet-processor.js');
-    worklet = new AudioWorkletNode(audioCtx, 'pcm-player');
-    gain    = audioCtx.createGain();
-    gain.gain.value = 1;
-    worklet.connect(gain);
-    gain.connect(audioCtx.destination);
-  } catch(e) {
-    showToast('Audio init failed: ' + e.message, 'error');
-    if(btn){btn.disabled=false;}
+    // Get LiveKit token + URL from our server
+    const res = await fetch(`${API}/api/session`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${authToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ channelId })
+    });
+    const data = await res.json();
+    if(!res.ok) throw new Error(data.error || 'Failed to get session');
+
+    const { token, url } = data;
+
+    // Web Audio for volume/mute control
+    const audioCtx = new AudioContext();
+    const gainNode = audioCtx.createGain();
+    gainNode.connect(audioCtx.destination);
+
+    // Create LiveKit room
+    const room = new LivekitClient.Room();
+
+    const sess = {
+      room, audioCtx, gain: gainNode,
+      muted: false, volume: 1,
+      name: channelName,
+      _elements: [],
+      _stopping: false,
+    };
+    activeSessions.set(channelId, sess);
     renderChannels(); updatePlayer();
-    return;
-  }
 
-  // Connect WebSocket to our relay
-  const proto  = location.protocol === 'https:' ? 'wss' : 'ws';
-  const wsUrl  = `${proto}://${location.host}/ws/channel/${encodeURIComponent(channelId)}?token=${encodeURIComponent(authToken)}`;
-  const ws     = new WebSocket(wsUrl);
-  ws.binaryType = 'arraybuffer';
+    // Wire up audio track handler before connecting
+    room.on(LivekitClient.RoomEvent.TrackSubscribed, (track) => {
+      if (track.kind !== LivekitClient.Track.Kind.Audio) return;
+      const s = activeSessions.get(channelId);
+      if (!s) return;
 
-  // Store session immediately so Stop button renders
-  activeSessions.set(channelId, {
-    ws, audioCtx, worklet, gain,
-    muted: false, volume: 1,
-    name: channelName,
-    callerName: ch.caller_name || '',
-    _stopping: false,
-  });
-  renderChannels(); updatePlayer();
+      const el = track.attach();
+      // We route audio through Web Audio API for volume control, so mute the element itself
+      el.muted = true;
+      el.style.display = 'none';
+      document.body.appendChild(el);
+      s._elements.push(el);
 
-  ws.onopen = () => {
+      try {
+        const src = s.audioCtx.createMediaElementSource(el);
+        src.connect(s.gain);
+        // Unmute the element now that it's piped through the gain node
+        el.muted = false;
+      } catch(e) {
+        console.error('Web Audio routing error:', e);
+        // Fallback: just play directly
+        el.muted = false;
+      }
+    });
+
+    room.on(LivekitClient.RoomEvent.Disconnected, () => {
+      const s = activeSessions.get(channelId);
+      if (s && !s._stopping) {
+        showToast(`Disconnected from ${channelName}`, 'error');
+        _cleanupSession(channelId);
+      }
+    });
+
+    await room.connect(url, token);
+
+    // Resume AudioContext — browsers require a user gesture; connect() is triggered by click so this should work
+    if (audioCtx.state === 'suspended') await audioCtx.resume();
+
     showToast(`Listening: ${channelName}`, 'success');
     if(btn){btn.disabled=false;}
-  };
 
-  ws.onmessage = ({ data }) => {
-    if(typeof data === 'string') {
-      // Control message from relay
-      try {
-        const msg = JSON.parse(data);
-        const sess = activeSessions.get(channelId);
-        if(msg.type === 'reconnecting') {
-          showToast(`${channelName}: reconnecting…`, 'info');
-          if(sess) sess._reconnecting = true;
-        } else if(msg.type === 'connected') {
-          if(sess) sess._reconnecting = false;
-        } else if(msg.type === 'offline') {
-          showToast(`${channelName}: caller offline`, 'info');
-        }
-      } catch {}
-      return;
-    }
-    // Binary PCM — transfer to AudioWorklet (zero-copy)
-    const sess = activeSessions.get(channelId);
-    if(sess && sess.worklet) {
-      sess.worklet.port.postMessage(data, [data]);
-    }
-  };
-
-  ws.onclose = () => {
-    const sess = activeSessions.get(channelId);
-    if(!sess || sess._stopping) {
-      cleanupSession(channelId);
-      renderChannels(); updatePlayer();
-      return;
-    }
-    // Unexpected close (server restarted) — auto-reconnect after 3s
-    console.log(`WebSocket closed for ${channelName}, reconnecting in 3s…`);
-    cleanupSession(channelId);
-    renderChannels(); updatePlayer();
-    setTimeout(() => {
-      if(!activeSessions.has(channelId)) startChannel(channelId, channelName);
-    }, 3000);
-  };
-
-  ws.onerror = () => {
-    showToast(`Connection error: ${channelName}`, 'error');
-  };
-
+  } catch(e) {
+    showToast(e.message || 'Connection failed', 'error');
+    _cleanupSession(channelId);
+    if(btn){btn.disabled=false;}
+  }
 }
 
 async function stopChannel(channelId) {
   const sess = activeSessions.get(channelId);
   if (!sess) return;
   sess._stopping = true;
-  try { sess.ws.close(1000, 'User stopped'); } catch {}
-  try { await sess.audioCtx.close(); } catch {}
-  cleanupSession(channelId);
-  renderChannels(); updatePlayer();
+  try { sess.room.disconnect(); } catch(_){}
+  _cleanupSession(channelId);
 }
 
-function cleanupSession(id) {
-  const sess = activeSessions.get(id);
-  if (sess) {
-    try { sess.ws.close(); } catch {}
-    try { sess.audioCtx.close(); } catch {}
-  }
-  activeSessions.delete(id);
-}
-
-// ─── Change password ───────────────────────────────────────────────────────
-function openChangePassword(){
-  ['cpCurrent','cpNew','cpConfirm'].forEach(id=>document.getElementById(id).value='');
-  document.getElementById('cpMsg').textContent='';
+// ─── Change password modal ────────────────────────────────────────────────────
+function openChangePassword() {
   document.getElementById('cpModal').classList.add('show');
+  document.getElementById('cpMsg').textContent='';
+  document.getElementById('cpMsg').className='modal-msg';
+  ['cpCurrent','cpNew','cpConfirm'].forEach(id=>document.getElementById(id).value='');
 }
-function closeModal(){document.getElementById('cpModal').classList.remove('show');}
-async function changePassword(){
-  const curr=document.getElementById('cpCurrent').value,nw=document.getElementById('cpNew').value,conf=document.getElementById('cpConfirm').value;
+function closeModal() {
+  document.getElementById('cpModal').classList.remove('show');
+}
+async function changePassword() {
+  const cur=document.getElementById('cpCurrent').value;
+  const nw=document.getElementById('cpNew').value;
+  const cf=document.getElementById('cpConfirm').value;
   const msg=document.getElementById('cpMsg');
-  msg.className='modal-msg';
-  if(!curr||!nw){msg.classList.add('err');msg.textContent='Fill in all fields.';return;}
-  if(nw!==conf){msg.classList.add('err');msg.textContent='New passwords do not match.';return;}
-  try{
-    const res=await fetch(`${API}/auth/change-password`,{method:'POST',
-      headers:{'Authorization':`Bearer ${authToken}`,'Content-Type':'application/json'},
-      body:JSON.stringify({currentPassword:curr,newPassword:nw})});
+  msg.textContent=''; msg.className='modal-msg';
+  if(!cur||!nw||!cf){msg.textContent='All fields required.';msg.classList.add('err');return;}
+  if(nw!==cf){msg.textContent='New passwords do not match.';msg.classList.add('err');return;}
+  if(nw.length<6){msg.textContent='Password must be at least 6 characters.';msg.classList.add('err');return;}
+  try {
+    const res=await fetch(`${API}/auth/change-password`,{
+      method:'POST',headers:{'Authorization':`Bearer ${authToken}`,'Content-Type':'application/json'},
+      body:JSON.stringify({currentPassword:cur,newPassword:nw})
+    });
     const data=await res.json();
     if(!res.ok) throw new Error(data.error||'Failed');
-    msg.classList.add('ok');msg.textContent='Password changed!';
-    setTimeout(closeModal,1200);
-  }catch(e){msg.classList.add('err');msg.textContent=e.message;}
+    msg.textContent='Password changed! Please sign in again.';msg.classList.add('ok');
+    setTimeout(signOut,1800);
+  } catch(e){msg.textContent=e.message;msg.classList.add('err');}
 }
-
-// ─── Helpers ───────────────────────────────────────────────────────────────
-let toastTimer;
-function showToast(msg,type='success'){
-  const t=document.getElementById('toast');
-  document.getElementById('tdot').style.background=type==='error'?'var(--red)':type==='info'?'var(--accent)':'var(--green)';
-  document.getElementById('tmsg').textContent=msg;
-  t.classList.add('show');
-  clearTimeout(toastTimer);
-  toastTimer=setTimeout(()=>t.classList.remove('show'),3000);
-}
-function esc(s){if(!s)return'';return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
-
-// Resume any suspended AudioContexts when the user returns to the tab
-document.addEventListener('visibilitychange', () => {
-  if(document.visibilityState !== 'visible') return;
-  activeSessions.forEach(sess => {
-    if(sess.audioCtx && sess.audioCtx.state === 'suspended') {
-      sess.audioCtx.resume().catch(() => {});
-    }
-  });
-});
 </script>
 </body>
 </html>

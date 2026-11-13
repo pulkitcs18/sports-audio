@@ -545,7 +545,6 @@ function renderSchedule() {
     ${chs.map(ch=>`<div class="schedule-row">
       <div class="schedule-time">${new Date(ch.starts_at).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}</div>
       <div class="schedule-name">${esc(ch.display_name)}</div>
-      ${ch.caller_name?`<div class="schedule-caller">${esc(ch.caller_name)}</div>`:''}
     </div>`).join('')}
   `).join('');
 }

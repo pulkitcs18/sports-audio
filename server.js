@@ -3,9 +3,11 @@ const express      = require('express');
 const axios        = require('axios');
 const cors         = require('cors');
 const path         = require('path');
+const crypto       = require('crypto');
 const Database     = require('better-sqlite3');
 const bcrypt       = require('bcryptjs');
 const jwt          = require('jsonwebtoken');
+const rateLimit    = require('express-rate-limit');
 
 // ── Env validation ────────────────────────────────────────────────────────
 const BASE_URL        = 'https://stevesrodeo.com';
@@ -16,6 +18,8 @@ const STEVE_PASSWORD  = process.env.STEVE_PASSWORD;
 const JWT_SECRET      = process.env.JWT_SECRET;
 const ADMIN_USERNAME  = process.env.ADMIN_USERNAME;
 const ADMIN_PASSWORD  = process.env.ADMIN_PASSWORD;
+// Comma-separated list of allowed origins, e.g. "https://sportsaudio.dev,http://localhost:3000"
+const CORS_ORIGINS    = (process.env.CORS_ORIGINS || 'http://localhost:3000').split(',').map(s => s.trim());
 
 for (const [k, v] of Object.entries({
   STEVE_DEVICE_ID: DEVICE_ID, STEVE_USERNAME, STEVE_PASSWORD,
@@ -46,28 +50,36 @@ db.exec(`CREATE TABLE IF NOT EXISTS user_channels (
   PRIMARY KEY (user_id, channel_id)
 )`);
 
-// Seed family accounts with full_access=1 (they existed before the access system)
+// Sessions table: one active session per user; login kills all previous sessions
+db.exec(`CREATE TABLE IF NOT EXISTS sessions (
+  id         TEXT    PRIMARY KEY,
+  user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  created_at INTEGER NOT NULL,
+  last_seen  INTEGER NOT NULL
+)`);
+
+// Seed family accounts — passwords come from env vars, NOT hardcoded here.
+// Set SEED_HARSHIT_PW, SEED_PRIYA_PW, etc. in .env or skip seeding entirely.
 const SEED_USERS = [
-  { username: 'harshit', password: 'Audio@2026'  },
-  { username: 'priya',   password: 'Listen@2026' },
-  { username: 'rahul',   password: 'Sports@2026' },
-  { username: 'anita',   password: 'Games@2026'  },
-  { username: 'vikram',  password: 'Play@2026'   },
+  { username: 'harshit', envKey: 'SEED_HARSHIT_PW'  },
+  { username: 'priya',   envKey: 'SEED_PRIYA_PW'    },
+  { username: 'rahul',   envKey: 'SEED_RAHUL_PW'    },
+  { username: 'anita',   envKey: 'SEED_ANITA_PW'    },
+  { username: 'vikram',  envKey: 'SEED_VIKRAM_PW'   },
 ];
-const insertUser = db.prepare(
-  'INSERT OR IGNORE INTO users (username, password_hash, full_access) VALUES (?, ?, 1)'
-);
+const insertUser     = db.prepare('INSERT OR IGNORE INTO users (username, password_hash, full_access) VALUES (?, ?, 1)');
 const grantFullAccess = db.prepare('UPDATE users SET full_access = 1 WHERE username = ?');
 for (const u of SEED_USERS) {
-  insertUser.run(u.username, bcrypt.hashSync(u.password, 10));
-  grantFullAccess.run(u.username); // idempotent — upgrades existing rows too
+  const pw = process.env[u.envKey];
+  if (pw) {
+    insertUser.run(u.username, bcrypt.hashSync(pw, 10));
+    grantFullAccess.run(u.username);
+  }
 }
 console.log('✅ SQLite users ready');
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
-// Returns the channel IDs a user is allowed to access.
-// null means full access (no filtering needed).
 function getAllowedChannels(userId) {
   const user = db.prepare('SELECT full_access FROM users WHERE id = ?').get(userId);
   if (!user || user.full_access) return null;
@@ -109,9 +121,44 @@ async function getSteveToken() {
 
 // ── Express ───────────────────────────────────────────────────────────────
 const app = express();
-app.use(cors());
-app.use(express.json());
+
+// CORS: only allow our own domain(s)
+app.use(cors({
+  origin: (origin, cb) => {
+    // Allow requests with no origin (same-origin browser requests, curl, Postman)
+    if (!origin || CORS_ORIGINS.includes(origin)) return cb(null, true);
+    cb(new Error(`CORS: origin ${origin} not allowed`));
+  },
+  credentials: true,
+}));
+
+app.use(express.json({ limit: '16kb' }));
 app.use(express.static(path.join(__dirname, 'public')));
+
+// ── Rate limiting ─────────────────────────────────────────────────────────
+
+// Strict limit on login: 10 attempts per 15 minutes per IP
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many login attempts. Try again in 15 minutes.' },
+});
+
+// General API limit: 200 req/min per IP (protects against scraping)
+const apiLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 200,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests.' },
+});
+
+app.use('/api/', apiLimiter);
+app.use('/auth/', apiLimiter);
+
+// ── Auth middleware ───────────────────────────────────────────────────────
 
 function requireAuth(req, res, next) {
   const header = req.headers['authorization'] || '';
@@ -120,6 +167,15 @@ function requireAuth(req, res, next) {
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
     if (decoded.role === 'admin') return res.status(403).json({ error: 'Use user token' });
+    if (!decoded.sessionId) return res.status(401).json({ error: 'Invalid token format' });
+
+    // Validate session still exists in DB (killed if another device logged in)
+    const sess = db.prepare('SELECT id FROM sessions WHERE id = ? AND user_id = ?')
+      .get(decoded.sessionId, decoded.userId);
+    if (!sess) return res.status(401).json({ error: 'Session expired — please log in again' });
+
+    // Update last_seen
+    db.prepare('UPDATE sessions SET last_seen = ? WHERE id = ?').run(Date.now(), decoded.sessionId);
     req.user = decoded;
     next();
   } catch { res.status(401).json({ error: 'Invalid or expired token' }); }
@@ -139,18 +195,41 @@ function requireAdmin(req, res, next) {
 
 // ── Auth routes ───────────────────────────────────────────────────────────
 
-// POST /auth/login  (family users)
-app.post('/auth/login', (req, res) => {
+// POST /auth/login
+app.post('/auth/login', loginLimiter, (req, res) => {
   try {
     const { username, password } = req.body;
     if (!username || !password) return res.status(400).json({ error: 'Username and password required' });
     const user = db.prepare('SELECT * FROM users WHERE username = ?').get(username);
-    if (!user || !bcrypt.compareSync(password, user.password_hash))
-      return res.status(401).json({ error: 'Invalid credentials' });
-    const token = jwt.sign({ username: user.username, userId: user.id }, JWT_SECRET, { expiresIn: '7d' });
+    // Always run bcrypt compare to prevent timing-based username enumeration
+    const hash = user ? user.password_hash : '$2a$10$invalidhashfortimingnormalization';
+    const valid = bcrypt.compareSync(password, hash);
+    if (!user || !valid) return res.status(401).json({ error: 'Invalid credentials' });
+
+    // One active session per user — kill all previous sessions (logs out other devices)
+    const killed = db.prepare('DELETE FROM sessions WHERE user_id = ?').run(user.id).changes;
+    if (killed > 0) console.log(`⚠️  Killed ${killed} existing session(s) for ${user.username}`);
+
+    // Create new session
+    const sessionId = crypto.randomBytes(32).toString('hex');
+    db.prepare('INSERT INTO sessions (id, user_id, created_at, last_seen) VALUES (?, ?, ?, ?)')
+      .run(sessionId, user.id, Date.now(), Date.now());
+
+    const token = jwt.sign(
+      { username: user.username, userId: user.id, sessionId },
+      JWT_SECRET,
+      { expiresIn: '7d' }
+    );
     console.log(`✅ Login: ${username}`);
     res.json({ token, username: user.username });
   } catch (err) { console.error('Login error:', err); res.status(500).json({ error: 'Server error' }); }
+});
+
+// POST /auth/logout
+app.post('/auth/logout', requireAuth, (req, res) => {
+  db.prepare('DELETE FROM sessions WHERE id = ?').run(req.user.sessionId);
+  console.log(`✅ Logout: ${req.user.username}`);
+  res.json({ ok: true });
 });
 
 // POST /auth/change-password
@@ -158,18 +237,20 @@ app.post('/auth/change-password', requireAuth, (req, res) => {
   try {
     const { currentPassword, newPassword } = req.body;
     if (!currentPassword || !newPassword) return res.status(400).json({ error: 'Missing fields' });
-    if (newPassword.length < 6) return res.status(400).json({ error: 'New password must be at least 6 characters' });
+    if (newPassword.length < 8) return res.status(400).json({ error: 'New password must be at least 8 characters' });
     const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user.userId);
     if (!user || !bcrypt.compareSync(currentPassword, user.password_hash))
       return res.status(401).json({ error: 'Current password is incorrect' });
     db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(bcrypt.hashSync(newPassword, 10), user.id);
+    // Invalidate ALL sessions — force re-login on every device
+    db.prepare('DELETE FROM sessions WHERE user_id = ?').run(user.id);
     console.log(`✅ Password changed: ${user.username}`);
     res.json({ ok: true });
   } catch (err) { res.status(500).json({ error: 'Server error' }); }
 });
 
-// POST /admin/login  (admin username + password → admin JWT)
-app.post('/admin/login', (req, res) => {
+// POST /admin/login
+app.post('/admin/login', loginLimiter, (req, res) => {
   const { username, password } = req.body || {};
   if (!username || !password) return res.status(400).json({ error: 'Username and password required' });
   if (username !== ADMIN_USERNAME || password !== ADMIN_PASSWORD)
@@ -181,22 +262,21 @@ app.post('/admin/login', (req, res) => {
 
 // ── Admin routes ──────────────────────────────────────────────────────────
 
-// GET /admin/users  — list all users
 app.get('/admin/users', requireAdmin, (req, res) => {
   const users = db.prepare('SELECT id, username, full_access FROM users ORDER BY username').all();
   const result = users.map(u => {
-    const channelCount = db.prepare('SELECT COUNT(*) as n FROM user_channels WHERE user_id = ?').get(u.id).n;
-    return { id: u.id, username: u.username, full_access: !!u.full_access, channel_count: channelCount };
+    const channelCount   = db.prepare('SELECT COUNT(*) as n FROM user_channels WHERE user_id = ?').get(u.id).n;
+    const activeSessions = db.prepare('SELECT COUNT(*) as n FROM sessions WHERE user_id = ?').get(u.id).n;
+    return { id: u.id, username: u.username, full_access: !!u.full_access, channel_count: channelCount, active_sessions: activeSessions };
   });
   res.json(result);
 });
 
-// POST /admin/users  — create user (no access by default)
 app.post('/admin/users', requireAdmin, (req, res) => {
   try {
     const { username, password } = req.body;
     if (!username || !password) return res.status(400).json({ error: 'Username and password required' });
-    if (password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
+    if (password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
     const hash = bcrypt.hashSync(password, 10);
     const result = db.prepare('INSERT INTO users (username, password_hash, full_access) VALUES (?, ?, 0)').run(username, hash);
     console.log(`✅ Admin created user: ${username}`);
@@ -207,7 +287,6 @@ app.post('/admin/users', requireAdmin, (req, res) => {
   }
 });
 
-// DELETE /admin/users/:id  — delete user
 app.delete('/admin/users/:id', requireAdmin, (req, res) => {
   const user = db.prepare('SELECT username FROM users WHERE id = ?').get(req.params.id);
   if (!user) return res.status(404).json({ error: 'User not found' });
@@ -216,18 +295,27 @@ app.delete('/admin/users/:id', requireAdmin, (req, res) => {
   res.json({ ok: true });
 });
 
-// POST /admin/users/:id/reset-password
 app.post('/admin/users/:id/reset-password', requireAdmin, (req, res) => {
   const { password } = req.body;
-  if (!password || password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
+  if (!password || password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
   const user = db.prepare('SELECT username FROM users WHERE id = ?').get(req.params.id);
   if (!user) return res.status(404).json({ error: 'User not found' });
   db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(bcrypt.hashSync(password, 10), req.params.id);
+  // Kill active sessions — force re-login
+  db.prepare('DELETE FROM sessions WHERE user_id = ?').run(req.params.id);
   console.log(`✅ Admin reset password for: ${user.username}`);
   res.json({ ok: true });
 });
 
-// GET /admin/users/:id/channels  — get user's access config
+// Kick user: kill their session so they're logged out immediately
+app.post('/admin/users/:id/kick', requireAdmin, (req, res) => {
+  const user = db.prepare('SELECT username FROM users WHERE id = ?').get(req.params.id);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+  db.prepare('DELETE FROM sessions WHERE user_id = ?').run(req.params.id);
+  console.log(`✅ Admin kicked: ${user.username}`);
+  res.json({ ok: true });
+});
+
 app.get('/admin/users/:id/channels', requireAdmin, (req, res) => {
   const user = db.prepare('SELECT id, username, full_access FROM users WHERE id = ?').get(req.params.id);
   if (!user) return res.status(404).json({ error: 'User not found' });
@@ -235,14 +323,10 @@ app.get('/admin/users/:id/channels', requireAdmin, (req, res) => {
   res.json({ id: user.id, username: user.username, full_access: !!user.full_access, channels });
 });
 
-// PUT /admin/users/:id/channels  — set user's access config
-// Body: { full_access: bool, channel_ids: string[] }
 app.put('/admin/users/:id/channels', requireAdmin, (req, res) => {
   const user = db.prepare('SELECT id, username FROM users WHERE id = ?').get(req.params.id);
   if (!user) return res.status(404).json({ error: 'User not found' });
-
   const { full_access, channel_ids } = req.body;
-
   db.transaction(() => {
     db.prepare('UPDATE users SET full_access = ? WHERE id = ?').run(full_access ? 1 : 0, user.id);
     db.prepare('DELETE FROM user_channels WHERE user_id = ?').run(user.id);
@@ -251,12 +335,10 @@ app.put('/admin/users/:id/channels', requireAdmin, (req, res) => {
       for (const cid of channel_ids) insert.run(user.id, cid);
     }
   })();
-
   console.log(`✅ Admin updated channels for ${user.username}: full_access=${full_access}, channels=${channel_ids?.length ?? 0}`);
   res.json({ ok: true });
 });
 
-// GET /admin/channels  — full channel list for admin UI (unfiltered)
 app.get('/admin/channels', requireAdmin, async (req, res) => {
   try {
     const token = await getSteveToken();
@@ -269,7 +351,8 @@ app.get('/admin/channels', requireAdmin, async (req, res) => {
   }
 });
 
-// GET /api/channels  — filtered by user's access
+// ── API routes ────────────────────────────────────────────────────────────
+
 app.get('/api/channels', requireAuth, async (req, res) => {
   try {
     const token = await getSteveToken();
@@ -277,7 +360,7 @@ app.get('/api/channels', requireAuth, async (req, res) => {
       headers: { 'Authorization': `Bearer ${token}`, 'x-device-id': DEVICE_ID }
     });
     const allowed = getAllowedChannels(req.user.userId);
-    if (allowed === null) return res.json(data); // full access
+    if (allowed === null) return res.json(data);
     const allowedSet = new Set(allowed);
     res.json(data.filter(ch => allowedSet.has(ch.id)));
   } catch (err) {
@@ -285,14 +368,13 @@ app.get('/api/channels', requireAuth, async (req, res) => {
   }
 });
 
-// POST /api/session — proxy to Steve's Rodeo session/start, return LiveKit credentials
-// Browser uses these to connect directly to LiveKit (sub-300ms latency)
+// POST /api/session — returns LiveKit credentials for browser-side WebRTC connection
 app.post('/api/session', requireAuth, async (req, res) => {
   try {
     const { channelId } = req.body;
-    if (!channelId) return res.status(400).json({ error: 'channelId required' });
+    if (!channelId || typeof channelId !== 'string' || channelId.length > 200)
+      return res.status(400).json({ error: 'channelId required' });
 
-    // Enforce channel access
     const allowed = getAllowedChannels(req.user.userId);
     if (allowed !== null && !allowed.includes(channelId)) {
       console.warn(`⛔ ${req.user.username} denied access to channel ${channelId}`);
@@ -307,7 +389,6 @@ app.post('/api/session', requireAuth, async (req, res) => {
     );
 
     console.log(`🎵 ${req.user.username} joined channel ${channelId}`);
-    // data contains { session_id, token (LiveKit JWT), url (LiveKit WS URL) }
     res.json({ token: data.token, url: data.url, sessionId: data.session_id });
   } catch (err) {
     console.error('Session error:', err.message);
@@ -333,6 +414,7 @@ process.on('SIGINT',  () => shutdown('SIGINT'));
 
 // ── Start ─────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log(`\n✅ Sports Audio server running at http://localhost:${PORT}\n`);
+  console.log(`\n✅ Sports Audio server running at http://localhost:${PORT}`);
+  console.log(`   CORS origins: ${CORS_ORIGINS.join(', ')}\n`);
   getSteveToken().catch(err => console.error("Initial Steve's token fetch failed:", err.message));
 });

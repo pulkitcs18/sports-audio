@@ -435,13 +435,18 @@ async function doLogin() {
   finally{ btn.disabled=false; btn.textContent='SIGN IN'; }
 }
 
-async function signOut() {
+async function signOut(reason) {
   clearInterval(channelRefreshTimer);
   await Promise.all([...activeSessions.keys()].map(id=>stopChannel(id)));
+  // Best-effort server-side session invalidation
+  if (authToken) {
+    fetch(`${API}/auth/logout`, { method:'POST', headers:{ 'Authorization':`Bearer ${authToken}` } }).catch(()=>{});
+  }
   authToken=null; currentUser=null; channels=[];
   document.getElementById('app').style.display='none';
   document.getElementById('loginPage').style.display='flex';
-  document.getElementById('loginErr').textContent='';
+  const errEl = document.getElementById('loginErr');
+  errEl.textContent = reason || '';
   document.getElementById('lp').value='';
 }
 
@@ -463,6 +468,11 @@ async function loadChannels(manual=false) {
   }
   try {
     const res=await fetch(`${API}/api/channels`,{headers:{'Authorization':`Bearer ${authToken}`}});
+    if(res.status===401) {
+      // Session was killed (another device logged in, or admin kicked)
+      signOut('Your session was ended. Please sign in again.');
+      return;
+    }
     if(!res.ok) return;
     channels=await res.json();
     renderChannels(); renderSchedule();
